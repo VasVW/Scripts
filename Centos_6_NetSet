@@ -1,0 +1,176 @@
+#!/bin/bash
+
+
+set -e
+
+
+GREEN="\033[1;32m"
+BLUE="\033[1;34m"
+RED="\033[1;31m"
+RESET="\033[0m"
+
+
+trap 'echo -e "${RED}Error: Command \"$BASH_COMMAND\" failed at line $LINENO.${RESET}"; exit 1' ERR
+
+echo -e "${GREEN}Starting the CentOS 6 network configuration script...${RESET}"
+
+
+echo -e "${BLUE}Do you want to change the hostname? (y/n):${RESET}"
+read -r change_hostname
+
+
+echo -e "${BLUE}Do you want to update the CentOS 6 repository? (y/n):${RESET}"
+read -r update_repo
+
+
+echo -e "${BLUE}Please enter the static IP address for the machine:${RESET}"
+read -r static_ip
+
+echo -e "${BLUE}Please enter the subnet mask (e.g., 255.255.255.0):${RESET}"
+read -r subnet_mask
+
+
+gateway="10.5.0.232"
+dns1="10.5.0.11"
+dns2="10.0.0.114"
+search_domain="adcluster.targetix.net"
+
+
+echo -e "${BLUE}Backing up existing network configurations...${RESET}"
+network_config_dir="/etc/sysconfig/network-scripts"
+backup_dir="/etc/sysconfig/network-scripts-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$backup_dir"
+cp -a "$network_config_dir/ifcfg-"* "$backup_dir/"
+
+echo -e "${BLUE}Deleting existing network configuration files...${RESET}"
+find "$network_config_dir" -type f -name 'ifcfg-*' ! -name 'ifcfg-lo' -exec rm -f {} \;
+
+
+interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^(eth|enp|ens|eno|enx|em|p[0-9]+p[0-9]+)')
+
+
+temp_config="$network_config_dir/ifcfg-temp"
+for iface in $interfaces; do
+    echo -e "${BLUE}Attempting to configure interface $iface with DHCP...${RESET}"
+    cat << EOF > "$temp_config"
+DEVICE=$iface
+BOOTPROTO=dhcp
+ONBOOT=yes
+EOF
+    ifdown "$iface" || true
+    ifup "$iface"
+
+
+    sleep 5
+
+    if ip addr show "$iface" | grep -q "inet "; then
+        echo -e "${GREEN}Interface $iface has been configured successfully with DHCP.${RESET}"
+        working_iface="$iface"
+        break
+    else
+        echo -e "${RED}Interface $iface failed to obtain an IP address. Trying the next interface...${RESET}"
+    fi
+done
+
+if [ -z "$working_iface" ]; then
+    echo -e "${RED}Error: No working network interface found. Exiting.${RESET}"
+    exit 1
+fi
+
+
+mac_address=$(cat /sys/class/net/$working_iface/address)
+
+
+cores=$(lscpu | awk '/^Core\(s\) per socket:/ {cores_per_socket=$4} /^Socket\(s\):/ {sockets=$2} END {print cores_per_socket * sockets}')
+
+echo -e "${GREEN}Detected total physical cores: $cores${RESET}"
+
+
+final_config="$network_config_dir/ifcfg-$working_iface"
+echo -e "${BLUE}Configuring static IP for interface $working_iface...${RESET}"
+cat << EOF > "$final_config"
+DEVICE=$working_iface
+BOOTPROTO=static
+ONBOOT=yes
+IPADDR=$static_ip
+NETMASK=$subnet_mask
+GATEWAY=$gateway
+DNS1=$dns1
+DNS2=$dns2
+DOMAIN=$search_domain
+DEFROUTE=yes
+IPV4_FAILURE_FATAL=yes
+IPV6INIT=no
+NAME="System $working_iface"
+HWADDR=$mac_address
+ETHTOOL_OPTS="-L $working_iface combined $cores"
+EOF
+
+
+ifdown "$working_iface" || true
+ifup "$working_iface"
+
+if [[ "$change_hostname" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
+    echo -e "${BLUE}Changing hostname to $new_hostname...${RESET}"
+    echo -e "${BLUE}Please enter the new hostname for the machine:${RESET}"
+    read -r new_hostname
+    echo -e "${BLUE}Backing up and updating /etc/hosts...${RESET}"
+    cp /etc/hosts "/etc/hosts.backup-$(date +%Y%m%d-%H%M%S)"
+    echo -e "127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4\n::1         localhost localhost.localdomain localhost6 localhost6.localdomain6\n$static_ip  $new_hostname" > /etc/hosts
+else
+    echo -e "${BLUE}Skipping hostname configuration.${RESET}"
+fi
+
+if [[ "$update_repo" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
+    echo -e "${BLUE}Updating CentOS 6 repository to use the Vault repo...${RESET}"
+    update_centos_repo() {
+        local REPO_FILE="/etc/yum.repos.d/CentOS-Base.repo"
+    
+        if [[ -f "$REPO_FILE" ]]; then
+            echo -e "${GREEN}Updating $REPO_FILE for CentOS 6 vault repository...${RESET}"
+            cat > "$REPO_FILE" <<EOL
+[base]
+name=CentOS-\$releasever - Base
+baseurl=https://vault.centos.org/6.10/os/\$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-6
+
+[updates]
+name=CentOS-\$releasever - Updates
+baseurl=https://vault.centos.org/6.10/updates/\$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-6
+
+[extras]
+name=CentOS-\$releasever - Extras
+baseurl=https://vault.centos.org/6.10/extras/\$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-6
+
+[centosplus]
+name=CentOS-\$releasever - Plus
+mirrorlist=http://mirrorlist.centos.org/?release=\$releasever&arch=\$basearch&repo=centosplus&infra=\$infra
+gpgcheck=1
+enabled=0
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-6
+
+[contrib]
+name=CentOS-\$releasever - Contrib
+mirrorlist=http://mirrorlist.centos.org/?release=\$releasever&arch=\$basearch&repo=contrib&infra=\$infra
+gpgcheck=1
+enabled=0
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-6
+EOL
+        else
+            echo -e "${RED}Error: $REPO_FILE not found.${RESET}"
+            exit 1
+        fi
+    }
+
+    update_centos_repo
+else
+    echo -e "${BLUE}Skipping repository update.${RESET}"
+fi
+
+echo -e "${GREEN}Network configuration and optional updates completed successfully!${RESET}"
+
