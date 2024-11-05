@@ -1,0 +1,155 @@
+#!/bin/bash
+
+
+set -e
+
+
+trap 'echo -e "\033[1;31mError: Command \"$BASH_COMMAND\" failed at line $LINENO.\033[0m"; exit 1' ERR
+
+echo -e "\033[1;32mStarting the network configuration script...\033[0m"
+
+echo -e "\033[1;34mPlease enter the new hostname for the machine:\033[0m"
+read -r new_hostname
+
+echo -e "\033[1;34mUpdating the system hostname to $new_hostname...\033[0m"
+hostnamectl set-hostname "$new_hostname"
+
+echo -e "\033[1;34mUpdating /etc/hostname with the new hostname...\033[0m"
+echo "$new_hostname" > /etc/hostname
+
+echo -e "\033[1;34mUpdating /etc/hosts with the new hostname...\033[0m"
+sed -i "s/127.0.1.1.*/127.0.1.1\t$new_hostname/" /etc/hosts
+
+if ! grep -q "127.0.1.1" /etc/hosts; then
+    echo -e "127.0.1.1\t$new_hostname" >> /etc/hosts
+fi
+
+echo -e "\033[1;34mDeleting existing netplan configurations...\033[0m"
+rm -f /etc/netplan/*.yaml
+
+echo -e "\033[1;34mCreating a temporary netplan configuration with DHCP...\033[0m"
+cat << EOF > /etc/netplan/00-temp-netcfg.yaml
+network:
+  version: 2
+  ethernets:
+EOF
+
+interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^(eth|enp|ens|eno|enx|em|p[0-9]+p[0-9]+)')
+for iface in $interfaces; do
+    if ip link show "$iface" | grep -q "state UP"; then
+        echo -e "\033[1;34mInterface $iface is up. Turning it off...\033[0m"
+        ip link set "$iface" down
+    fi
+
+    cat << EOF >> /etc/netplan/00-temp-netcfg.yaml
+    $iface:
+      dhcp4: yes
+EOF
+done
+
+echo -e "\033[1;34mFixing permissions of the temporary netplan configuration...\033[0m"
+chmod 600 /etc/netplan/00-temp-netcfg.yaml
+
+echo -e "\033[1;34mApplying the temporary netplan configuration...\033[0m"
+netplan apply
+sleep 5 
+
+
+for iface in $interfaces; do
+    echo -e "\033[1;34mBringing up interface $iface...\033[0m"
+    ip link set "$iface" up
+    
+    echo -e "\033[1;34mWaiting for DHCP to assign an IP address on $iface...\033[0m"
+    retries=5
+    while [ $retries -gt 0 ]; do
+
+        if ip addr show "$iface" | grep -q "inet "; then
+            echo -e "\033[1;32mInterface $iface has an IP address.\033[0m"
+            break
+        fi
+        echo -e "\033[1;34mRetrying... ($retries retries left)\033[0m"
+        sleep 5
+        retries=$((retries - 1))
+    done
+
+    if [ $retries -eq 0 ]; then
+        echo -e "\033[1;31mFailed to get an IP address on $iface. Exiting script.\033[0m"
+        exit 1
+    fi
+
+    echo -e "\033[1;34mTesting connectivity on interface $iface...\033[0m"
+    
+    if ping -c 1 8.8.8.8 &> /dev/null; then
+        echo -e "\033[1;32mInterface $iface is working!\033[0m"
+        break
+    else
+        echo -e "\033[1;31mInterface $iface failed to connect to the internet. Exiting script.\033[0m"
+        exit 1
+    fi
+done
+
+if ! command -v nmap &> /dev/null; then
+    echo -e "\033[1;34mInstalling nmap...\033[0m"
+    apt-get update
+    apt-get install -y nmap
+fi
+
+echo -e "\033[1;34mFinding the next available IP address in the 10.5.4.x range...\033[0m"
+
+for i in {1..254}; do
+    ip="10.5.4.$i"
+    echo -e "\033[1;34mChecking IP address $ip...\033[0m"
+    
+    nmap_output=$(nmap -sn $ip/32)
+    
+    echo "$nmap_output"
+    
+    if echo "$nmap_output" | grep -q "Host is up"; then
+        echo -e "\033[1;31m$ip is already in use.\033[0m"
+    else
+        echo -e "\033[1;32m$ip is available. Selecting this IP address.\033[0m"
+        selected_ip=$ip
+        break
+    fi
+done
+
+if [ -z "$selected_ip" ]; then
+    echo -e "\033[1;31mError: No available IP addresses found. Exiting.\033[0m"
+    exit 1
+fi
+
+mac=$(cat /sys/class/net/$iface/address)
+echo -e "\033[1;34mMAC address of interface $iface: $mac\033[0m"
+
+echo -e "\033[1;34mConfiguring netplan...\033[0m"
+cat << EOF > /etc/netplan/01-netcfg.yaml
+network:
+  version: 2
+  ethernets:
+    $iface:
+      match:
+        macaddress: $mac
+      addresses:
+        - $selected_ip/16
+      routes:
+        - to: 0.0.0.0/0
+          via: 10.5.0.232
+      nameservers:
+        addresses:
+          - 10.5.0.11
+          - 10.0.0.114
+        search: [adcluster.targetix.net]
+      dhcp4: no
+EOF
+
+echo -e "\033[1;34mFixing permissions of the final netplan configuration...\033[0m"
+chmod 600 /etc/netplan/01-netcfg.yaml
+
+echo -e "\033[1;34mApplying the new netplan configuration...\033[0m"
+netplan apply
+
+echo -e "\033[1;34mDeleting the temporary netplan configuration...\033[0m"
+rm -f /etc/netplan/00-temp-netcfg.yaml
+
+echo -e "\033[1;32mNetwork configuration completed successfully!\033[0m"
+
