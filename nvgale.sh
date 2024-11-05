@@ -17,7 +17,7 @@ if [ ! -f ~/nvim-linux64.tar.gz ]; then
   exit 1
 fi
 
-tar -xzf ~/nvim-linux64.tar.gz | 
+tar -xzf ~/nvim-linux64.tar.gz 
 echo "extracted "
 
 mkdir -p ~/.local/bin
